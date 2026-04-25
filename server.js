@@ -43,6 +43,9 @@ let totalUsers = 0;
 // Per-project message counters for quota
 const projectStats = new Map(); // projectId → { sent, users }
 
+// projectId → groupId → { members: Set, messages[] }
+const groupRegistry = new Map();
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function getToken(req) {
@@ -253,6 +256,56 @@ const server = http.createServer(async (req, res) => {
       }
       // 200 even if not found — idempotent delete
       return send(res, 200, { status: 'not_found' });
+    }
+
+    // POST /group/:groupId/message — broadcast encrypted message to group members
+    const groupMsgMatch = path.match(/^\/group\/([^/]+)\/message$/);
+    if (req.method === 'POST' && groupMsgMatch) {
+      const projectId = validateToken(token);
+      if (!projectId) return send(res, 401, { error: 'Invalid token' });
+
+      let body;
+      try { body = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
+
+      const groupId = decodeURIComponent(groupMsgMatch[1]);
+      const { from, members, ciphertext, groupHeader } = body;
+
+      if (!from || !members || !Array.isArray(members) || !ciphertext || !groupHeader) {
+        return send(res, 400, { error: 'Missing fields: from, members, ciphertext, groupHeader' });
+      }
+
+      const project = registry.get(projectId);
+      if (!project) return send(res, 404, { error: 'No users registered' });
+
+      // Deliver to each member's inbox (except sender)
+      const delivered = [];
+      const failed = [];
+      for (const memberId of members) {
+        if (memberId === from) continue;
+        const member = project.get(memberId);
+        if (!member) { failed.push(memberId); continue; }
+        if (member.messages.length >= MAX_MSG) { failed.push(memberId); continue; }
+        const id = crypto.randomBytes(12).toString('hex');
+        member.messages.push({
+          id,
+          from,
+          ciphertext,
+          header: '',        // not used for group messages
+          groupId,
+          groupHeader,
+          timestamp: new Date().toISOString(),
+        });
+        member.lastActivity = Date.now();
+        totalMessages++;
+        delivered.push(memberId);
+      }
+
+      const ps = projectStats.get(projectId) || { sent: 0, users: 0 };
+      ps.sent += delivered.length;
+      projectStats.set(projectId, ps);
+
+      log(`group msg: ${from} → group:${groupId} (${delivered.length} delivered, ${failed.length} failed)`);
+      return send(res, 200, { status: 'delivered', delivered, failed });
     }
 
     return send(res, 404, { error: 'Not found' });
