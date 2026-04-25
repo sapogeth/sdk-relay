@@ -159,7 +159,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 503, { error: 'Server at capacity' });
       }
 
-      project.set(user_id, { publicKeys, messages: [], lastActivity: Date.now(), msgCount: 0 });
+      const registeredAt = project.has(user_id) ? project.get(user_id).registeredAt : Date.now();
+      project.set(user_id, { publicKeys, messages: [], lastActivity: Date.now(), msgCount: 0, registeredAt });
 
       if (isNew) {
         totalUsers++;
@@ -256,6 +257,67 @@ const server = http.createServer(async (req, res) => {
       }
       // 200 even if not found — idempotent delete
       return send(res, 200, { status: 'not_found' });
+    }
+
+    // DELETE /user/:userId — GDPR right to erasure
+    // Deletes all user data: public keys, queued messages, registration record
+    const deleteUserMatch = path.match(/^\/user\/([^/]+)$/);
+    if (req.method === 'DELETE' && deleteUserMatch) {
+      const projectId = validateToken(token);
+      if (!projectId) return send(res, 401, { error: 'Invalid token' });
+
+      const userId = decodeURIComponent(deleteUserMatch[1]);
+      const project = registry.get(projectId);
+      const user = project?.get(userId);
+
+      if (!user) return send(res, 404, { error: 'User not found' });
+
+      const pendingMessages = user.messages.length;
+      project.delete(userId);
+      totalUsers = Math.max(0, totalUsers - 1);
+
+      const ps = projectStats.get(projectId);
+      if (ps) ps.users = Math.max(0, ps.users - 1);
+
+      log(`GDPR erasure: ${userId} @ ${projectId} (${pendingMessages} messages deleted)`);
+      return send(res, 200, {
+        status: 'erased',
+        userId,
+        deletedAt: new Date().toISOString(),
+        messagesDeleted: pendingMessages,
+      });
+    }
+
+    // GET /user/:userId/export — GDPR data portability (Art. 20)
+    // Returns what the relay stores about this user (metadata only, no plaintext)
+    const exportUserMatch = path.match(/^\/user\/([^/]+)\/export$/);
+    if (req.method === 'GET' && exportUserMatch) {
+      const projectId = validateToken(token);
+      if (!projectId) return send(res, 401, { error: 'Invalid token' });
+
+      const userId = decodeURIComponent(exportUserMatch[1]);
+      const user = registry.get(projectId)?.get(userId);
+
+      if (!user) return send(res, 404, { error: 'User not found' });
+
+      return send(res, 200, {
+        userId,
+        exportedAt: new Date().toISOString(),
+        relay: 'relay.stvor.xyz',
+        data: {
+          // Public keys are public — not sensitive
+          publicKeys: user.publicKeys,
+          // Metadata the relay holds
+          pendingMessages: user.messages.length,
+          registeredAt: new Date(user.registeredAt).toISOString(),
+          lastActivity: new Date(user.lastActivity).toISOString(),
+          // What the relay does NOT store:
+          // - Message content (E2EE — relay only has ciphertext)
+          // - Sender identity (if sealedSender: true)
+          // - Any plaintext data
+        },
+        notice: 'Message content is end-to-end encrypted. The relay cannot access or export it.',
+      });
     }
 
     // POST /group/:groupId/message — broadcast encrypted message to group members
