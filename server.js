@@ -194,7 +194,7 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON' }); }
 
-      const { to, from, ciphertext, header } = body;
+      const { to, from, ciphertext, header, pqcCt } = body;
       if (!to || !from || !ciphertext || header === undefined) {
         return send(res, 400, { error: 'Missing fields: to, from, ciphertext, header' });
       }
@@ -209,7 +209,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       const id = crypto.randomBytes(12).toString('hex');
-      recipient.messages.push({ id, from, ciphertext, header, timestamp: new Date().toISOString() });
+      const msg = { id, from, ciphertext, header, timestamp: new Date().toISOString() };
+      if (pqcCt) msg.pqcCt = pqcCt;
+      recipient.messages.push(msg);
       recipient.lastActivity = Date.now();
       totalMessages++;
 
